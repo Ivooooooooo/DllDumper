@@ -4,6 +4,16 @@
 #include <string>
 #include <Windows.h>
 
-void parseArguments(int argc, char* argv[], DWORD& pid, std::string& dllName, std::string& outputFile);
+struct Options {
+	DWORD pid = 0;
+	std::string process;
+	std::string dllName;
+	std::string output;
+	bool list = false;
+	bool help = false;
+};
+
+void printUsage(const char* exeName);
+bool parseArguments(int argc, char* argv[], Options& options);
 
 #endif // ARGUMENT_PARSER_H
