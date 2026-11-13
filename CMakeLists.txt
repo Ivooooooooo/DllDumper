@@ -10,6 +10,8 @@ add_executable(DllDumper
 	Dumper.cpp
 	Logger.cpp
 	ProcessUtils.cpp
+	RemoteMemory.cpp
+	Scanner.cpp
 )
 
 target_link_libraries(DllDumper PRIVATE advapi32)

@@ -6,26 +6,30 @@
 #include <vector>
 #include <Windows.h>
 
+#include "RemoteMemory.h"
+
 struct DumpTarget {
 	DWORD pid = 0;
 	std::string moduleName;
 	std::string modulePath;
-	uintptr_t base = 0;
-	SIZE_T mappedSize = 0;
+	Address base = 0;
+	Address fallbackSize = 0;  // only used when the header cannot be read
+	bool imageLayout = true;   // sections sit at their VirtualAddress
 };
 
 struct UnreadableRange {
-	uintptr_t address = 0;
-	SIZE_T size = 0;
+	Address address = 0;
+	Address size = 0;
 };
 
 struct DumpResult {
-	SIZE_T imageSize = 0;
+	Address imageSize = 0;
 	bool sizeFromHeaders = false;
 	bool headersFixed = false;
+	bool managed = false;
 	std::vector<UnreadableRange> unreadable;
 };
 
-bool DumpModule(HANDLE process, const DumpTarget& target, const std::string& outputPath, DumpResult& result);
+bool DumpModule(const RemoteMemory& memory, const DumpTarget& target, const std::string& outputPath, DumpResult& result);
 
 #endif // DUMPER_H

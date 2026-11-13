@@ -8,14 +8,12 @@
 
 #include "Hex.h"
 #include "Logger.h"
-#include "ProcessUtils.h"
+#include "RemoteMemory.h"
+#include "Scanner.h"
 
 namespace fs = std::filesystem;
 
 namespace {
-
-// Anything above this is a broken header rather than a real image
-constexpr SIZE_T kMaxImageSize = 0x40000000;
 
 std::string jsonEscape(const std::string& value) {
 	std::string escaped;
@@ -52,64 +50,65 @@ std::string isoTimeNow() {
 	return buffer;
 }
 
-SIZE_T imageSizeFromHeaders(HANDLE process, uintptr_t base) {
-	uint8_t header[0x1000];
-	SIZE_T read = 0;
-	if (!ReadProcessMemory(process, reinterpret_cast<LPCVOID>(base), header, sizeof(header), &read)) {
-		return 0;
-	}
-	if (read < sizeof(IMAGE_DOS_HEADER)) {
-		return 0;
-	}
+// Without a memory map the only option is to read in blocks and shrink to single
+// pages around whatever fails
+void readImageByBlocks(const RemoteMemory& memory, Address base, Address size, std::vector<uint8_t>& image, std::vector<UnreadableRange>& unreadable) {
+	constexpr Address kBlock = 0x10000;
+	constexpr Address kPage = 0x1000;
 
-	const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(header);
-	if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
-		return 0;
-	}
+	Address offset = 0;
+	while (offset < size) {
+		Address length = size - offset;
+		if (length > kBlock) {
+			length = kBlock;
+		}
 
-	const size_t ntOffset = static_cast<size_t>(dos->e_lfanew);
-	if (dos->e_lfanew <= 0 || ntOffset + sizeof(IMAGE_NT_HEADERS64) > read || ntOffset + sizeof(IMAGE_NT_HEADERS64) > sizeof(header)) {
-		return 0;
-	}
+		SIZE_T read = 0;
+		if (memory.read(base + offset, image.data() + offset, static_cast<SIZE_T>(length), &read) && read == length) {
+			offset += length;
+			continue;
+		}
 
-	if (*reinterpret_cast<const DWORD*>(header + ntOffset) != IMAGE_NT_SIGNATURE) {
-		return 0;
-	}
+		for (Address page = 0; page < length; page += kPage) {
+			Address pageLength = length - page;
+			if (pageLength > kPage) {
+				pageLength = kPage;
+			}
 
-	const WORD magic = *reinterpret_cast<const WORD*>(header + ntOffset + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER));
+			SIZE_T pageRead = 0;
+			const SIZE_T wanted = static_cast<SIZE_T>(pageLength);
+			if (!memory.read(base + offset + page, image.data() + offset + page, wanted, &pageRead) || pageRead != wanted) {
+				unreadable.push_back({ base + offset + page, pageLength });
+			}
+		}
 
-	SIZE_T imageSize = 0;
-	if (magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
-		imageSize = reinterpret_cast<const IMAGE_NT_HEADERS64*>(header + ntOffset)->OptionalHeader.SizeOfImage;
+		offset += length;
 	}
-	else if (magic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
-		imageSize = reinterpret_cast<const IMAGE_NT_HEADERS32*>(header + ntOffset)->OptionalHeader.SizeOfImage;
-	}
-
-	if (imageSize < 0x1000 || imageSize > kMaxImageSize) {
-		return 0;
-	}
-	return imageSize;
 }
 
 // Reads [base, base + size) in as few pieces as the memory map allows. A single
 // ReadProcessMemory over the whole range gives up as soon as it finds one page it
 // cannot touch, which happens a lot with sections the loader discards.
-bool readImage(HANDLE process, uintptr_t base, SIZE_T size, std::vector<uint8_t>& image, std::vector<UnreadableRange>& unreadable) {
-	image.assign(size, 0);
+bool readImage(const RemoteMemory& memory, Address base, Address size, std::vector<uint8_t>& image, std::vector<UnreadableRange>& unreadable) {
+	image.assign(static_cast<size_t>(size), 0);
 
-	SIZE_T offset = 0;
+	if (!memory.canQuery()) {
+		readImageByBlocks(memory, base, size, image, unreadable);
+		return true;
+	}
+
+	Address offset = 0;
 	while (offset < size) {
-		const uintptr_t address = base + offset;
+		const Address address = base + offset;
 
-		MEMORY_BASIC_INFORMATION info{};
-		if (!VirtualQueryEx(process, reinterpret_cast<LPCVOID>(address), &info, sizeof(info))) {
-			logger.log(ERROR_T, "VirtualQueryEx failed at " + toHex(address) + ": " + describeError(GetLastError()));
+		MemoryRegion region;
+		if (!memory.query(address, region)) {
+			logger.log(ERROR_T, "Could not query the memory at " + toHex(address) + ".");
 			return false;
 		}
 
-		const uintptr_t regionEnd = reinterpret_cast<uintptr_t>(info.BaseAddress) + info.RegionSize;
-		SIZE_T chunk = regionEnd - address;
+		const Address regionEnd = region.base + region.size;
+		Address chunk = regionEnd - address;
 		if (chunk == 0) {
 			break;
 		}
@@ -117,9 +116,10 @@ bool readImage(HANDLE process, uintptr_t base, SIZE_T size, std::vector<uint8_t>
 			chunk = size - offset;
 		}
 
-		const bool readable = info.State == MEM_COMMIT && (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0;
+		const bool readable = region.state == MEM_COMMIT && (region.protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0;
 		SIZE_T read = 0;
-		if (!readable || !ReadProcessMemory(process, reinterpret_cast<LPCVOID>(address), image.data() + offset, chunk, &read) || read != chunk) {
+		const SIZE_T wanted = static_cast<SIZE_T>(chunk);
+		if (!readable || !memory.read(address, image.data() + offset, wanted, &read) || read != wanted) {
 			unreadable.push_back({ address, chunk });
 		}
 
@@ -130,7 +130,7 @@ bool readImage(HANDLE process, uintptr_t base, SIZE_T size, std::vector<uint8_t>
 }
 
 template <typename NtHeaders>
-bool fixHeadersImpl(std::vector<uint8_t>& image, size_t ntOffset, uintptr_t base) {
+bool fixHeadersImpl(std::vector<uint8_t>& image, size_t ntOffset, Address base) {
 	auto* nt = reinterpret_cast<NtHeaders*>(image.data() + ntOffset);
 
 	IMAGE_SECTION_HEADER* sections = IMAGE_FIRST_SECTION(nt);
@@ -178,7 +178,7 @@ bool fixHeadersImpl(std::vector<uint8_t>& image, size_t ntOffset, uintptr_t base
 	return true;
 }
 
-bool fixHeaders(std::vector<uint8_t>& image, uintptr_t base) {
+bool fixHeaders(std::vector<uint8_t>& image, Address base) {
 	if (image.size() < sizeof(IMAGE_DOS_HEADER)) {
 		return false;
 	}
@@ -221,8 +221,10 @@ bool writeSidecar(const std::string& dumpPath, const DumpTarget& target, const D
 	sidecar << "  \"path\": \"" << jsonEscape(target.modulePath) << "\",\n";
 	sidecar << "  \"image_base\": \"" << toHex(target.base) << "\",\n";
 	sidecar << "  \"image_size\": " << result.imageSize << ",\n";
+	sidecar << "  \"managed\": " << (result.managed ? "true" : "false") << ",\n";
 	sidecar << "  \"size_from_headers\": " << (result.sizeFromHeaders ? "true" : "false") << ",\n";
 	sidecar << "  \"headers_fixed\": " << (result.headersFixed ? "true" : "false") << ",\n";
+	sidecar << "  \"image_layout\": " << (target.imageLayout ? "true" : "false") << ",\n";
 	sidecar << "  \"dumped_at\": \"" << isoTimeNow() << "\",\n";
 
 	sidecar << "  \"unreadable\": [";
@@ -239,25 +241,33 @@ bool writeSidecar(const std::string& dumpPath, const DumpTarget& target, const D
 
 }
 
-bool DumpModule(HANDLE process, const DumpTarget& target, const std::string& outputPath, DumpResult& result) {
-	SIZE_T imageSize = imageSizeFromHeaders(process, target.base);
-	result.sizeFromHeaders = imageSize != 0;
-	if (!result.sizeFromHeaders) {
-		logger.log(WARNING, "No usable PE header at " + toHex(target.base) + ", using the size Toolhelp reported.");
-		imageSize = target.mappedSize;
+bool DumpModule(const RemoteMemory& memory, const DumpTarget& target, const std::string& outputPath, DumpResult& result) {
+	ScannedImage described;
+	if (describeImage(memory, target.base, described)) {
+		result.imageSize = described.size;
+		result.sizeFromHeaders = true;
+		result.managed = described.managed;
+
+		if (!target.imageLayout && described.rawSize != 0) {
+			result.imageSize = described.rawSize;
+		}
 	}
-	if (imageSize == 0) {
+	else {
+		logger.log(WARNING, "No usable PE header at " + toHex(target.base) + ", falling back to the size the loader reported.");
+		result.imageSize = target.fallbackSize;
+	}
+
+	if (result.imageSize == 0) {
 		logger.log(ERROR_T, "The module reports size 0, nothing to dump.");
 		return false;
 	}
-	result.imageSize = imageSize;
 
 	std::vector<uint8_t> image;
-	if (!readImage(process, target.base, imageSize, image, result.unreadable)) {
+	if (!readImage(memory, target.base, result.imageSize, image, result.unreadable)) {
 		return false;
 	}
 
-	if (result.sizeFromHeaders) {
+	if (target.imageLayout && result.sizeFromHeaders) {
 		result.headersFixed = fixHeaders(image, target.base);
 		if (!result.headersFixed) {
 			logger.log(WARNING, "The section headers could not be rebuilt, the file keeps the memory layout.");
