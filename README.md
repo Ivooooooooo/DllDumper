@@ -62,3 +62,37 @@ elevated process gets it.
 The dump is the module as it sits in memory, so the file is not the same as the one
 on disk: relocations are already applied and the import table holds the resolved
 addresses.
+
+## The dump
+
+`SizeOfImage` is taken from the PE header rather than from `modBaseSize`, and the
+image is read region by region with `VirtualQueryEx` in front, so one page the
+loader threw away does not abort the whole dump. Those ranges are written as zeros
+and listed in the sidecar.
+
+The section headers are then rewritten so that `PointerToRawData` equals
+`VirtualAddress` and `SizeOfRawData` equals `VirtualSize`, with `FileAlignment` set
+to the section alignment. The result is a file where the offset and the RVA are the
+same number, and `ImageBase` is set to the address the module was actually loaded
+at, so a disassembler shows the same addresses the debugger does. No rebase needed.
+
+Next to the dump there is a `.json` with the pid, the original path, the image base,
+the size and every range that could not be read:
+
+```json
+{
+  "pid": 19368,
+  "module": "shell32.dll",
+  "path": "C:\\Windows\\System32\\SHELL32.dll",
+  "image_base": "0x7FFD8CDD0000",
+  "image_size": 7798784,
+  "size_from_headers": true,
+  "headers_fixed": true,
+  "dumped_at": "2026-11-13T20:32:24Z",
+  "unreadable": []
+}
+```
+
+Imports are still resolved pointers into other modules, they were fixed up by the
+loader before we got to read the image. If you need the import table back, feed the
+dump to something like Scylla.

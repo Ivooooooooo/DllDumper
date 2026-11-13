@@ -107,13 +107,27 @@ int main(int argc, char* argv[]) {
 		return kExitProcess;
 	}
 
-	const bool dumped = CopyDLL(process, reinterpret_cast<LPCVOID>(module.base), module.mappedSize, output.string().c_str());
+	DumpTarget target;
+	target.pid = pid;
+	target.moduleName = module.name;
+	target.modulePath = module.path;
+	target.base = module.base;
+	target.mappedSize = module.mappedSize;
+
+	DumpResult result;
+	const bool dumped = DumpModule(process, target, output.string(), result);
 	CloseHandle(process);
 
 	if (!dumped) {
 		return kExitDump;
 	}
 
-	logger.log(INFO, "Dump written.");
+	logger.log(INFO, "Dumped " + toHex(result.imageSize) + (result.headersFixed
+		? " with the section headers rebuilt for a flat layout."
+		: "."));
+	if (!result.unreadable.empty()) {
+		logger.log(WARNING, std::to_string(result.unreadable.size()) + " range(s) could not be read and are zero filled, they are listed in the .json.");
+	}
+	logger.log(INFO, "Done.");
 	return kExitOk;
 }
