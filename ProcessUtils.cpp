@@ -7,10 +7,6 @@
 
 namespace {
 
-bool equalsIgnoreCase(const std::string& first, const std::string& second) {
-	return first.size() == second.size() && _stricmp(first.c_str(), second.c_str()) == 0;
-}
-
 std::string fileNameOf(const std::string& path) {
 	size_t pos = path.find_last_of("\\/");
 	return (pos == std::string::npos) ? path : path.substr(pos + 1);
@@ -38,6 +34,135 @@ HANDLE snapshotModules(DWORD pid) {
 	return INVALID_HANDLE_VALUE;
 }
 
+Bitness machineBitness(USHORT machine) {
+	switch (machine) {
+	case IMAGE_FILE_MACHINE_I386: return Bitness::X86;
+	case IMAGE_FILE_MACHINE_AMD64: return Bitness::X64;
+	case IMAGE_FILE_MACHINE_ARM64: return Bitness::Arm64;
+	default: return Bitness::Unknown;
+	}
+}
+
+struct UnicodeString64 {
+	USHORT length;
+	USHORT maximumLength;
+	ULONG padding;
+	ULONG64 buffer;
+};
+
+struct ProcessBasicInformation64 {
+	ULONG64 reserved1;
+	ULONG64 pebBaseAddress;
+	ULONG64 reserved2[2];
+	ULONG64 uniqueProcessId;
+	ULONG64 reserved3;
+};
+
+// Offsets of the 64-bit PEB and LDR structures, they have not moved in years
+constexpr Address kPebLdr = 0x18;
+constexpr Address kLdrInLoadOrder = 0x10;
+constexpr Address kEntryDllBase = 0x30;
+constexpr Address kEntrySizeOfImage = 0x40;
+constexpr Address kEntryFullDllName = 0x48;
+constexpr Address kEntryBaseDllName = 0x58;
+
+std::string utf16ToUtf8(const std::wstring& text) {
+	if (text.empty()) {
+		return std::string();
+	}
+
+	const int length = WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+	std::string result(static_cast<size_t>(length), '\0');
+	WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), &result[0], length, nullptr, nullptr);
+	return result;
+}
+
+bool readUnicodeString64(const RemoteMemory& memory, Address address, std::wstring& text) {
+	UnicodeString64 value{};
+	if (!memory.read(address, &value, sizeof(value))) {
+		return false;
+	}
+	if (value.length == 0 || value.length > 2048 || value.buffer == 0) {
+		return false;
+	}
+
+	std::wstring wide(value.length / sizeof(wchar_t), L'\0');
+	if (!memory.read(value.buffer, &wide[0], value.length)) {
+		return false;
+	}
+
+	text = wide;
+	return true;
+}
+
+// Toolhelp gives back a 32-bit PEB when a WOW64 process asks about a 64-bit one, so
+// the module list has to come from the real PEB instead
+bool listModulesFromPeb64(const RemoteMemory& memory, std::vector<ModuleInfo>& modules) {
+	using NtWow64QueryInformationProcess64Fn = NTSTATUS(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+
+	static const NtWow64QueryInformationProcess64Fn queryProcess = reinterpret_cast<NtWow64QueryInformationProcess64Fn>(
+		GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtWow64QueryInformationProcess64"));
+
+	if (queryProcess == nullptr) {
+		return false;
+	}
+
+	ProcessBasicInformation64 info{};
+	ULONG returned = 0;
+	if (queryProcess(memory.process(), 0, &info, sizeof(info), &returned) < 0 || info.pebBaseAddress == 0) {
+		logger.log(ERROR_T, "Could not read the 64-bit PEB of the target.");
+		return false;
+	}
+
+	Address ldr = 0;
+	if (!memory.readPointer(info.pebBaseAddress + kPebLdr, ldr) || ldr == 0) {
+		return false;
+	}
+
+	const Address listHead = ldr + kLdrInLoadOrder;
+	Address current = 0;
+	if (!memory.readPointer(listHead, current)) {
+		return false;
+	}
+
+	modules.clear();
+	for (int guard = 0; guard < 4096 && current != 0 && current != listHead; ++guard) {
+		Address dllBase = 0;
+		Address sizeOfImage = 0;
+		if (!memory.readPointer(current + kEntryDllBase, dllBase) ||
+			!memory.readPointer(current + kEntrySizeOfImage, sizeOfImage)) {
+			break;
+		}
+
+		ModuleInfo module;
+		module.base = dllBase;
+		module.mappedSize = static_cast<SIZE_T>(sizeOfImage);
+
+		std::wstring fullName;
+		std::wstring baseName;
+		readUnicodeString64(memory, current + kEntryFullDllName, fullName);
+		readUnicodeString64(memory, current + kEntryBaseDllName, baseName);
+
+		module.path = utf16ToUtf8(fullName);
+		module.name = utf16ToUtf8(baseName);
+		if (module.name.empty() && !module.path.empty()) {
+			module.name = fileNameOf(module.path);
+		}
+
+		if (dllBase != 0) {
+			modules.push_back(module);
+		}
+
+		Address next = 0;
+		if (!memory.readPointer(current, next)) {
+			break;
+		}
+		current = next;
+	}
+
+	return !modules.empty();
+}
+
 }
 
 std::string describeError(DWORD code) {
@@ -63,6 +188,47 @@ std::string describeError(DWORD code) {
 		text.pop_back();
 	}
 	return text;
+}
+
+const char* bitnessName(Bitness bitness) {
+	switch (bitness) {
+	case Bitness::X86: return "x86";
+	case Bitness::X64: return "x64";
+	case Bitness::Arm64: return "arm64";
+	default: return "unknown";
+	}
+}
+
+Bitness selfBitness() {
+	return sizeof(void*) == 8 ? Bitness::X64 : Bitness::X86;
+}
+
+Bitness processBitness(HANDLE process) {
+	using IsWow64Process2Fn = BOOL(WINAPI*)(HANDLE, USHORT*, USHORT*);
+
+	// Loaded by hand so the binary still starts on systems without it
+	static const IsWow64Process2Fn isWow64Process2 = reinterpret_cast<IsWow64Process2Fn>(
+		GetProcAddress(GetModuleHandleA("kernel32.dll"), "IsWow64Process2"));
+
+	if (isWow64Process2 != nullptr) {
+		USHORT processMachine = 0;
+		USHORT nativeMachine = 0;
+		if (isWow64Process2(process, &processMachine, &nativeMachine) != FALSE) {
+			// UNKNOWN means the process is not being emulated, so it runs as the
+			// machine the system is
+			return machineBitness(processMachine == IMAGE_FILE_MACHINE_UNKNOWN ? nativeMachine : processMachine);
+		}
+	}
+
+	BOOL wow64 = FALSE;
+	if (IsWow64Process(process, &wow64) != FALSE && wow64 != FALSE) {
+		return Bitness::X86;
+	}
+	return Bitness::Unknown;
+}
+
+bool sameName(const std::string& first, const std::string& second) {
+	return first.size() == second.size() && _stricmp(first.c_str(), second.c_str()) == 0;
 }
 
 bool enableDebugPrivilege() {
@@ -105,7 +271,7 @@ bool findProcessByName(const std::string& exeName, DWORD& pid) {
 
 	if (Process32First(snapshot, &entry)) {
 		do {
-			if (equalsIgnoreCase(entry.szExeFile, wanted)) {
+			if (sameName(entry.szExeFile, wanted)) {
 				matches.push_back(entry.th32ProcessID);
 			}
 		} while (Process32Next(snapshot, &entry));
@@ -152,20 +318,26 @@ bool listModules(DWORD pid, std::vector<ModuleInfo>& modules) {
 	return true;
 }
 
-bool findModule(DWORD pid, const std::string& name, ModuleInfo& module) {
-	std::vector<ModuleInfo> modules;
-	if (!listModules(pid, modules)) {
+bool listModulesForTarget(const RemoteMemory& memory, DWORD pid, std::vector<ModuleInfo>& modules) {
+	if (memory.isCrossBitness()) {
+		if (listModulesFromPeb64(memory, modules)) {
+			return true;
+		}
+		logger.log(ERROR_T, "Could not walk the 64-bit module list of the target.");
 		return false;
 	}
+	return listModules(pid, modules);
+}
 
+bool findModuleIn(const std::vector<ModuleInfo>& modules, const std::string& name, ModuleInfo& module) {
 	// The same DLL can be loaded twice from different paths, in that case the
 	// first one wins and we say so
 	const std::string wanted = fileNameOf(name);
 	const ModuleInfo* found = nullptr;
 
 	for (const ModuleInfo& candidate : modules) {
-		const bool nameMatches = equalsIgnoreCase(candidate.name, wanted);
-		const bool pathMatches = equalsIgnoreCase(candidate.path, name);
+		const bool nameMatches = sameName(candidate.name, wanted);
+		const bool pathMatches = sameName(candidate.path, name);
 		if (!nameMatches && !pathMatches) {
 			continue;
 		}
@@ -177,10 +349,53 @@ bool findModule(DWORD pid, const std::string& name, ModuleInfo& module) {
 	}
 
 	if (found == nullptr) {
-		logger.log(ERROR_T, name + " is not loaded in the process.");
 		return false;
 	}
 
 	module = *found;
 	return true;
+}
+
+ThreadSuspender::~ThreadSuspender() {
+	resume();
+}
+
+size_t ThreadSuspender::suspend(DWORD pid) {
+	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+	if (snapshot == INVALID_HANDLE_VALUE) {
+		logger.log(WARNING, "Could not list the threads to suspend: " + describeError(GetLastError()));
+		return 0;
+	}
+
+	THREADENTRY32 entry{};
+	entry.dwSize = sizeof(entry);
+
+	if (Thread32First(snapshot, &entry)) {
+		do {
+			if (entry.th32OwnerProcessID != pid) {
+				continue;
+			}
+
+			HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, entry.th32ThreadID);
+			if (thread == nullptr) {
+				continue;
+			}
+			if (SuspendThread(thread) == static_cast<DWORD>(-1)) {
+				CloseHandle(thread);
+				continue;
+			}
+			threads_.push_back(thread);
+		} while (Thread32Next(snapshot, &entry));
+	}
+
+	CloseHandle(snapshot);
+	return threads_.size();
+}
+
+void ThreadSuspender::resume() {
+	for (HANDLE thread : threads_) {
+		ResumeThread(thread);
+		CloseHandle(thread);
+	}
+	threads_.clear();
 }
